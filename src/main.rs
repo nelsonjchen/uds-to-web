@@ -51,7 +51,6 @@ fn main() {
     let connections = Rc::new(RefCell::new(HashMap::new()));
 
     let srv = socket.incoming().for_each(|(stream, addr)| {
-
         // We have to clone both of these values, because the `and_then`
         // function billow constructs a new future, `and_then` requires
         // `FnOnce`, so we construct a move closure to move the
@@ -60,62 +59,67 @@ fn main() {
         let connections_inner = connections.clone();
         let handle_inner = handle.clone();
 
-        accept_async(stream, None).and_then(move |ws_stream| {
-            println!("New WebSocket connection: {}", addr);
+        accept_async(stream, None)
+            .and_then(move |ws_stream| {
+                println!("New WebSocket connection: {}", addr);
 
-            // Create a channel for our stream, which other sockets will use to
-            // send us messages. Then register our address with the stream to send
-            // data to us.
-            let (tx, rx) = futures::sync::mpsc::unbounded();
-            connections_inner.borrow_mut().insert(addr, tx);
+                // Create a channel for our stream, which other sockets will use to
+                // send us messages. Then register our address with the stream to send
+                // data to us.
+                let (tx, rx) = futures::sync::mpsc::unbounded();
+                connections_inner.borrow_mut().insert(addr, tx);
 
-            // Let's split the WebSocket stream, so we can work with the
-            // reading and writing halves separately.
-            let (sink, stream) = ws_stream.split();
+                // Let's split the WebSocket stream, so we can work with the
+                // reading and writing halves separately.
+                let (sink, stream) = ws_stream.split();
 
-            // Whenever we receive a message from the client, we print it and
-            // send to other clients, excluding the sender.
-            let connections = connections_inner.clone();
-            let ws_reader = stream.for_each(move |message: Message| {
-                println!("Received a message from {}: {}", addr, message);
+                // Whenever we receive a message from the client, we print it and
+                // send to other clients, excluding the sender.
+                let connections = connections_inner.clone();
+                let ws_reader = stream.for_each(move |message: Message| {
+                    println!("Received a message from {}: {}", addr, message);
 
-                // For each open connection except the sender, send the
-                // string via the channel.
-                let mut conns = connections.borrow_mut();
-                let iter = conns.iter_mut()
-                                .filter(|&(&k, _)| k != addr)
-                                .map(|(_, v)| v);
-                for tx in iter {
-                    tx.unbounded_send(message.clone()).unwrap();
-                }
+                    // For each open connection except the sender, send the
+                    // string via the channel.
+                    let mut conns = connections.borrow_mut();
+                    let iter = conns
+                        .iter_mut()
+                        .filter(|&(&k, _)| k != addr)
+                        .map(|(_, v)| v);
+                    for tx in iter {
+                        tx.unbounded_send(message.clone()).unwrap();
+                    }
+                    Ok(())
+                });
+
+                // Whenever we receive a string on the Receiver, we write it to
+                // `WriteHalf<WebSocketStream>`.
+                let ws_writer = rx.fold(sink, |mut sink, msg| {
+                    use futures::Sink;
+                    sink.start_send(msg).unwrap();
+                    Ok(sink)
+                });
+
+                // Now that we've got futures representing each half of the socket, we
+                // use the `select` combinator to wait for either half to be done to
+                // tear down the other. Then we spawn off the result.
+                let connection = ws_reader
+                    .map(|_| ())
+                    .map_err(|_| ())
+                    .select(ws_writer.map(|_| ()).map_err(|_| ()));
+
+                handle_inner.spawn(connection.then(move |_| {
+                    connections_inner.borrow_mut().remove(&addr);
+                    println!("Connection {} closed.", addr);
+                    Ok(())
+                }));
+
                 Ok(())
-            });
-
-            // Whenever we receive a string on the Receiver, we write it to
-            // `WriteHalf<WebSocketStream>`.
-            let ws_writer = rx.fold(sink, |mut sink, msg| {
-                use futures::Sink;
-                sink.start_send(msg).unwrap();
-                Ok(sink)
-            });
-
-            // Now that we've got futures representing each half of the socket, we
-            // use the `select` combinator to wait for either half to be done to
-            // tear down the other. Then we spawn off the result.
-            let connection = ws_reader.map(|_| ()).map_err(|_| ())
-                                      .select(ws_writer.map(|_| ()).map_err(|_| ()));
-
-            handle_inner.spawn(connection.then(move |_| {
-                connections_inner.borrow_mut().remove(&addr);
-                println!("Connection {} closed.", addr);
-                Ok(())
-            }));
-
-            Ok(())
-        }).map_err(|e| {
-            println!("Error during the websocket handshake occurred: {}", e);
-            Error::new(ErrorKind::Other, e)
-        })
+            })
+            .map_err(|e| {
+                println!("Error during the websocket handshake occurred: {}", e);
+                Error::new(ErrorKind::Other, e)
+            })
     });
 
     let stupid_future = futures::future::ok::<(), std::io::Error>(());
